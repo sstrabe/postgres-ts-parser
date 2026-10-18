@@ -8,7 +8,9 @@ import { TypegenOptions, applyTemplate, rowType } from './typegen';
 export interface SqlTemplate {
   /** The SQL with every `${...}` replaced by `$1`, `$2`, ... */
   sql: string;
-  /** Document range of the tag expression (`sql`, `db.sql`). */
+  /** Source text of the tag expression (`sql`, `db.sql`). */
+  tag: string;
+  /** Document range of the tag expression. */
   tagStart: number;
   tagEnd: number;
   /** Document range of the whole tagged template. */
@@ -109,6 +111,7 @@ function toTemplate(ts: typeof TS, node: TS.TaggedTemplateExpression, source: TS
 
   return {
     sql,
+    tag: node.tag.getText(source),
     tagStart: node.tag.getStart(source),
     tagEnd: node.tag.end,
     templateStart,

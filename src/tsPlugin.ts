@@ -1,18 +1,63 @@
 import type * as TS from 'typescript/lib/tsserverlibrary';
+import { TagShape, detectTagShapes } from './core/shapes';
+import { TypeEdit, typeArgumentEdit } from './core/templates';
 import { columnType } from './core/typegen';
-import { Config, SchemaStore, VirtualFile, expandAliases, mayContainTemplates, resolveConfig, restoreOriginal, virtualize } from './core/virtual';
+import {
+  Config,
+  SchemaStore,
+  VirtualFile,
+  expandAliases,
+  mayContainTemplates,
+  resolveConfig,
+  resolveTypeTemplate,
+  restoreOriginal,
+  virtualize,
+} from './core/virtual';
 
 /** Diagnostic code for SQL problems, so they're easy to tell apart from TypeScript's own. */
 const SQL_DIAGNOSTIC_CODE = 99001;
 
+/**
+ * tsserver command the VS Code extension uses to write inferred types into a file:
+ * arguments `{ file, start?, end? }`, response body `TypeEdit[]` (offsets into the file).
+ */
+const TYPE_EDITS_COMMAND = '_postgresTs.typeEdits';
+
+interface Instance {
+  reload(): void;
+  typeEdits(fileName: string, start?: number, end?: number): TypeEdit[] | undefined;
+}
+
+// tsserver calls `init` once per project but loads the module once, and protocol
+// handlers are per session, so the handler and its routing table live here.
+const instances = new Set<Instance>();
+let handlerRegistered = false;
+
+function registerHandler(session: TS.server.Session<unknown>) {
+  if (handlerRegistered) return;
+  handlerRegistered = true;
+  try {
+    session.addProtocolHandler(TYPE_EDITS_COMMAND, (request) => {
+      const args = (request.arguments ?? {}) as { file: string; start?: number; end?: number };
+      for (const instance of instances) {
+        const edits = instance.typeEdits(args.file, args.start, args.end);
+        if (edits) return { response: edits, responseRequired: true };
+      }
+      return { response: [], responseRequired: true };
+    });
+  } catch {
+    // Already registered by another copy of this plugin.
+  }
+}
+
 function init({ typescript: ts }: { typescript: typeof TS }): TS.server.PluginModule {
   let external: Partial<Config> | undefined;
-  const instances = new Set<() => void>();
+  const own = new Set<Instance>();
 
   return {
     onConfigurationChanged(config: Partial<Config>) {
       external = config;
-      for (const reload of instances) reload();
+      for (const instance of own) instance.reload();
     },
 
     create(info) {
@@ -30,17 +75,24 @@ function init({ typescript: ts }: { typescript: typeof TS }): TS.server.PluginMo
         if (watchers.has(dir) || !info.serverHost.watchDirectory) return;
         watchers.set(dir, info.serverHost.watchDirectory(dir, (f) => f.endsWith('.sql') && reload(), true));
       };
+      // tsserver's language service only rebuilds the program for a project marked dirty
+      // (the method is internal, but has long been stable).
+      const markDirty = () => (project as unknown as { markAsDirty?: () => void }).markAsDirty?.();
       const reload = () => {
         store.clear();
         files.clear();
-        (project as unknown as { markAsDirty?: () => void }).markAsDirty?.();
+        shapes.clear();
+        markDirty();
         project.refreshDiagnostics?.();
       };
-      instances.add(reload);
 
       // ------------------------------------------------- the virtual source files
 
       const files = new Map<string, { source: string; virtual: VirtualFile }>();
+      /** Tag shapes per file, keyed by tag text; read from the type checker. */
+      const shapes = new Map<string, Map<string, TagShape>>();
+      /** Bumped per file when its shapes change, so TypeScript re-reads it. */
+      const bumps = new Map<string, number>();
       const host = info.languageServiceHost;
       const getScriptSnapshot = host.getScriptSnapshot.bind(host);
       const getScriptVersion = host.getScriptVersion.bind(host);
@@ -58,7 +110,8 @@ function init({ typescript: ts }: { typescript: typeof TS }): TS.server.PluginMo
         }
         let virtual: VirtualFile;
         try {
-          virtual = virtualize(ts, fileName, text, store.forFile(fileName), cfg);
+          const known = shapes.get(fileName);
+          virtual = virtualize(ts, fileName, text, store.forFile(fileName), cfg, (t) => known?.get(t.tag));
         } catch (err) {
           log(`failed to type ${fileName}: ${err instanceof Error ? err.stack : err}`);
           return undefined;
@@ -71,8 +124,34 @@ function init({ typescript: ts }: { typescript: typeof TS }): TS.server.PluginMo
         const virtual = virtualFor(fileName);
         return virtual?.regions.length ? ts.ScriptSnapshot.fromString(virtual.text) : getScriptSnapshot(fileName);
       };
-      // Migrations changing must re-type files whose own text didn't change.
-      host.getScriptVersion = (fileName) => `${getScriptVersion(fileName)}@${store.generation}`;
+      // Migrations or tag shapes changing must re-type files whose own text didn't change.
+      host.getScriptVersion = (fileName) => `${getScriptVersion(fileName)}@${store.generation}.${bumps.get(fileName) ?? 0}`;
+      // tsserver skips rebuilding the program while the project version is unchanged.
+      let totalBumps = 0;
+      const getProjectVersion = host.getProjectVersion?.bind(host);
+      if (getProjectVersion) host.getProjectVersion = () => `${getProjectVersion()}@${store.generation}.${totalBumps}`;
+
+      // Whether a tag wants `Row` or `Row[]` comes from its signature, which needs a program.
+      // Files are first typed without type arguments for unknown tags; once a program
+      // exists the shapes are read and changed files re-typed before answering.
+      let checkedProgram: TS.Program | undefined;
+      const ensureShapes = () => {
+        const program = ls.getProgram();
+        if (!program || program === checkedProgram) return;
+        checkedProgram = program;
+        for (const [fileName, { virtual }] of files) {
+          if (!virtual.loaded || !virtual.templates.length) continue;
+          const found = detectTagShapes(ts, program, fileName, virtual.templates.map((t) => t.template));
+          const known = shapes.get(fileName);
+          const changed = [...found].some(([tag, shape]) => known?.get(tag) !== shape);
+          if (!changed) continue;
+          shapes.set(fileName, new Map([...(known ?? []), ...found]));
+          files.delete(fileName);
+          bumps.set(fileName, (bumps.get(fileName) ?? 0) + 1);
+          totalBumps++;
+          markDirty();
+        }
+      };
 
       // ----------------------------------------------------- language service
 
@@ -187,10 +266,71 @@ function init({ typescript: ts }: { typescript: typeof TS }): TS.server.PluginMo
         return r && { ...r, edits: cleanChanges(r.edits) };
       };
 
+      const typeEdits = (fileName: string, start = 0, end = Infinity): TypeEdit[] | undefined => {
+        if (!project.containsFile(ts.server.toNormalizedPath(fileName))) return undefined;
+        ensureShapes();
+        ls.getProgram(); // re-type files whose shapes just became known
+        const virtual = virtualFor(fileName);
+        if (!virtual?.loaded || !/\.(c|m)?tsx?$/.test(fileName)) return [];
+        const cfg = config();
+        const known = shapes.get(fileName);
+        return virtual.templates
+          .filter(({ template }) => template.start <= end && template.end >= start)
+          .map(({ template, analysis }) => {
+            const typeTemplate = resolveTypeTemplate(cfg, known?.get(template.tag));
+            return typeTemplate && typeArgumentEdit(template, analysis, virtual.loaded!.schema, { typeTemplate, overrides: cfg.typeOverrides });
+          })
+          .filter((e): e is TypeEdit => !!e);
+      };
+
+      for (const k of SEMANTIC_METHODS) {
+        const fn = proxy[k] as (...args: unknown[]) => unknown;
+        (proxy as unknown as Record<string, unknown>)[k] = (...args: unknown[]) => {
+          ensureShapes();
+          return fn(...args);
+        };
+      }
+
+      const instance = { reload, typeEdits };
+      instances.add(instance);
+      own.add(instance);
+      if (info.session) registerHandler(info.session);
+      proxy.dispose = () => {
+        instances.delete(instance);
+        own.delete(instance);
+        for (const w of watchers.values()) w.close();
+        ls.dispose();
+      };
+
       log(`attached to ${project.getProjectName()}`);
       return proxy;
     },
   };
 }
+
+/** Methods whose answers depend on types, and so on knowing each tag's shape first. */
+const SEMANTIC_METHODS = new Set<keyof TS.LanguageService>([
+  'getSemanticDiagnostics',
+  'getSuggestionDiagnostics',
+  'getCompletionsAtPosition',
+  'getCompletionEntryDetails',
+  'getQuickInfoAtPosition',
+  'getSignatureHelpItems',
+  'getDefinitionAtPosition',
+  'getDefinitionAndBoundSpan',
+  'getTypeDefinitionAtPosition',
+  'getImplementationAtPosition',
+  'getReferencesAtPosition',
+  'findReferences',
+  'findRenameLocations',
+  'getRenameInfo',
+  'getDocumentHighlights',
+  'getEncodedSemanticClassifications',
+  'getCodeFixesAtPosition',
+  'getCombinedCodeFix',
+  'getApplicableRefactors',
+  'getEditsForRefactor',
+  'provideInlayHints',
+]);
 
 export = init;

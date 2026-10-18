@@ -1,36 +1,11 @@
 import type * as TS from 'typescript';
 import { LoadedSchema, findMigrationsDir, loadSchema } from './loader';
 import { QueryAnalysis, SqlTemplate, analyzeQuery, scanSqlTemplates } from './templates';
+import { Config } from './config';
+import { TagShape } from './shapes';
 import { applyTemplate, rowType } from './typegen';
 
-export interface Config {
-  migrationsDir: string;
-  migrationsExclude: string[];
-  tags: string[];
-  typeTemplate: string;
-  typeOverrides: Record<string, string>;
-  diagnostics: 'error' | 'warning' | 'off';
-  reportParseErrors: boolean;
-}
-
-export const DEFAULT_CONFIG: Config = {
-  migrationsDir: 'migrations',
-  migrationsExclude: ['**/*.down.sql', '**/down.sql', '**/revert/**', '**/verify/**'],
-  tags: ['sql'],
-  typeTemplate: '{{row}}',
-  typeOverrides: {},
-  diagnostics: 'error',
-  reportParseErrors: false,
-};
-
-export function resolveConfig(...partials: Array<Partial<Config> | undefined>): Config {
-  const out = { ...DEFAULT_CONFIG };
-  for (const p of partials) {
-    if (!p) continue;
-    for (const [k, v] of Object.entries(p)) if (v !== undefined && k in DEFAULT_CONFIG) (out as Record<string, unknown>)[k] = v;
-  }
-  return out;
-}
+export { Config, DEFAULT_CONFIG, resolveConfig } from './config';
 
 /** Caches one schema per migrations folder. */
 export class SchemaStore {
@@ -104,7 +79,15 @@ export function mayContainTemplates(text: string, tags: string[]): boolean {
  * the template's (type-irrelevant) SQL text. When it doesn't fit, a short alias is used
  * and declared after the end of the file.
  */
-export function virtualize(ts: typeof TS, fileName: string, text: string, loaded: LoadedSchema | undefined, cfg: Config): VirtualFile {
+export function virtualize(
+  ts: typeof TS,
+  fileName: string,
+  text: string,
+  loaded: LoadedSchema | undefined,
+  cfg: Config,
+  /** The shape of a template's tag, once known (see detectTagShapes). */
+  shapeOf: (template: SqlTemplate) => TagShape | undefined = () => undefined,
+): VirtualFile {
   const found = scanSqlTemplates(ts, fileName, text, cfg.tags);
   const templates = found.templates.map((template) => ({
     template,
@@ -117,7 +100,9 @@ export function virtualize(ts: typeof TS, fileName: string, text: string, loaded
   let cursor = 0;
   for (const { template, analysis } of templates) {
     if (template.typeArgs || !analysis.columns || analysis.diagnostics.length) continue;
-    const type = applyTemplate(cfg.typeTemplate, rowType(analysis.columns, loaded.schema, { overrides: cfg.typeOverrides }));
+    const typeTemplate = resolveTypeTemplate(cfg, shapeOf(template));
+    if (!typeTemplate) continue;
+    const type = applyTemplate(typeTemplate, rowType(analysis.columns, loaded.schema, { overrides: cfg.typeOverrides }));
     // The span from the end of the tag to the first `${` (or closing backtick) is free to rewrite.
     const start = template.tagEnd;
     const end = template.headEnd;
@@ -157,4 +142,12 @@ export function restoreOriginal(text: string, regions: Region[]): string {
 export function expandAliases(text: string, aliases: Map<string, string>): string {
   if (!aliases.size) return text;
   return text.replace(/\bSqlRow\d+\b/g, (name) => aliases.get(name) ?? name);
+}
+
+/** The type argument template for a tag, or undefined when it must not get one (yet). */
+export function resolveTypeTemplate(cfg: Config, shape: TagShape | undefined): string | undefined {
+  if (shape === 'none') return undefined;
+  if (cfg.typeTemplate !== 'auto') return cfg.typeTemplate;
+  if (!shape) return undefined;
+  return shape === 'array' ? '{{row}}[]' : '{{row}}';
 }

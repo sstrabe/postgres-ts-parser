@@ -87,8 +87,8 @@
         },
         "postgresTs.typeTemplate": {
           "type": "string",
-          "default": "{{row}}",
-          "markdownDescription": "Shape of the generated type argument. `{{row}}` is replaced with the row object type. Use `{{row}}[]` for libraries whose generic is the result array (e.g. postgres.js)."
+          "default": "auto",
+          "markdownDescription": "Shape of the type argument given to the tag. `auto` reads the tag's signature: `Row[]` for postgres.js-style tags whose generic is the result array, `Row` otherwise, and nothing for tags that aren't generic. Or a template where `{{row}}` is the row object type, e.g. `{{row}}[]`."
         },
         "postgresTs.updateOnSave": {
           "type": "boolean",
@@ -147,6 +147,7 @@
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.6.0",
     "esbuild": "^0.25.0",
+    "postgres": "3.4.9",
     "vitest": "^5.0.5"
   },
   "pnpm": {

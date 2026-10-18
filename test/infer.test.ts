@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { buildSchema, splitStatements } from '../src/core/migrations';
 import { analyzeQuery, findSqlTemplates, typeArgumentEdit } from '../src/core/templates';
 import { rowType } from '../src/core/typegen';
+import { detectTagShapes } from '../src/core/shapes';
 import { resolveConfig, restoreOriginal, virtualize } from '../src/core/virtual';
 
 const dir = join(__dirname, 'fixtures/migrations');
@@ -117,7 +118,7 @@ describe('loader', () => {
 
 describe('virtual files', () => {
   const loaded = { dir, schema, warnings: [], fileCount: 3 };
-  const cfg = resolveConfig();
+  const cfg = resolveConfig({ typeTemplate: '{{row}}' });
 
   it('writes row types into the template head without moving any other character', () => {
     const source = [
@@ -151,10 +152,28 @@ describe('virtual files', () => {
     expect(virtualize(ts, 'q.ts', 'sql`SELECT * FROM users WHERE id = ${1}`', loaded, cfg).regions).toEqual([]);
   });
 
+  it('only types tags whose shape is known in auto mode', () => {
+    const auto = resolveConfig();
+    const src = 'export const q = sql`SELECT id FROM users`;';
+    expect(virtualize(ts, 'q.ts', src, loaded, auto).regions).toEqual([]);
+    expect(virtualize(ts, 'q.ts', src, loaded, auto, () => 'array').text).toContain('sql<{ id: number }[]>`');
+    expect(virtualize(ts, 'q.ts', src, loaded, auto, () => 'row').text).toContain('sql<{ id: number }>`');
+    expect(virtualize(ts, 'q.ts', src, loaded, cfg, () => 'none').regions).toEqual([]);
+  });
+
   it('restores original text in edits computed from the virtual file', () => {
     const source = 'export const b = sql`SELECT id FROM users`;';
     const v = virtualize(ts, 'q.ts', source, loaded, cfg);
     const extracted = v.text.slice(v.text.indexOf('sql'), v.text.indexOf(';'));
     expect(restoreOriginal(`function f() { return ${extracted}; }`, v.regions)).toBe('function f() { return sql`SELECT id FROM users`; }');
+  });
+});
+
+describe('tag shapes', () => {
+  it('reads Row vs Row[] vs no type argument from the tag signature', () => {
+    const file = join(__dirname, 'fixtures/shapes.ts');
+    const program = ts.createProgram([file], { strict: true, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, esModuleInterop: true });
+    const templates = findSqlTemplates(ts, file, readFileSync(file, 'utf8'), ['sql', 'rowTag', 'plainTag']);
+    expect(Object.fromEntries(detectTagShapes(ts, program, file, templates))).toEqual({ 'dbClient.sql': 'array', rowTag: 'row', plainTag: 'none' });
   });
 });

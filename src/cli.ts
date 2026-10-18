@@ -2,7 +2,8 @@
 // is a drop-in for `tsc --noEmit` that knows the inferred types of sql`...` queries.
 import * as path from 'node:path';
 import type * as TS from 'typescript';
-import { Config, SchemaStore, resolveConfig, virtualize } from './core/virtual';
+import { TagShape, detectTagShapes } from './core/shapes';
+import { Config, SchemaStore, VirtualFile, resolveConfig, virtualize } from './core/virtual';
 
 const PLUGIN_NAME = 'postgres-ts-sql-plugin';
 
@@ -38,21 +39,42 @@ function main(argv: string[]): number {
 
   const host = ts.createCompilerHost(parsed.options);
   const originals = new Map<string, TS.SourceFile>();
-  const sqlDiagnostics: TS.Diagnostic[] = [];
+  const virtuals = new Map<string, VirtualFile>();
+  /** Tag shapes per file; filled in after the first program, as in the tsserver plugin. */
+  const shapes = new Map<string, Map<string, TagShape>>();
   const getSourceFile = host.getSourceFile;
   host.getSourceFile = (fileName, languageVersion, onError, shouldCreate) => {
-    const original = getSourceFile(fileName, languageVersion, onError, shouldCreate);
+    const original = originals.get(fileName) ?? getSourceFile(fileName, languageVersion, onError, shouldCreate);
     if (!original || original.isDeclarationFile || fileName.includes('/node_modules/')) return original;
-    const virtual = virtualize(ts, fileName, original.text, store.forFile(fileName), config);
-    originals.set(original.fileName, original);
-    if (virtual.loaded && config.diagnostics !== 'off') {
+    originals.set(fileName, original);
+    const known = shapes.get(fileName);
+    const virtual = virtualize(ts, fileName, original.text, store.forFile(fileName), config, (t) => known?.get(t.tag));
+    virtuals.set(fileName, virtual);
+    if (!virtual.regions.length) return original;
+    return ts.createSourceFile(fileName, virtual.text, languageVersion, true);
+  };
+
+  const createProgram = (oldProgram?: TS.Program) =>
+    ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options, host, projectReferences: parsed.projectReferences, oldProgram });
+  let program = createProgram();
+  let reshaped = false;
+  for (const [fileName, virtual] of virtuals) {
+    if (!virtual.loaded || !virtual.templates.length) continue;
+    shapes.set(fileName, detectTagShapes(ts, program, fileName, virtual.templates.map((t) => t.template)));
+    reshaped = true;
+  }
+  if (reshaped) program = createProgram(program);
+
+  const sqlDiagnostics: TS.Diagnostic[] = [];
+  if (config.diagnostics !== 'off') {
+    for (const [fileName, virtual] of virtuals) {
       for (const { template, analysis } of virtual.templates) {
         const found = [...analysis.diagnostics];
         if (analysis.parseError && config.reportParseErrors) found.push(analysis.parseError);
         for (const d of found) {
           const start = template.toDocumentOffset(d.start);
           sqlDiagnostics.push({
-            file: original,
+            file: originals.get(fileName),
             start,
             length: Math.max(template.toDocumentOffset(d.end) - start, 1),
             messageText: d.message,
@@ -62,11 +84,8 @@ function main(argv: string[]): number {
         }
       }
     }
-    if (!virtual.regions.length) return original;
-    return ts.createSourceFile(fileName, virtual.text, languageVersion, true);
-  };
+  }
 
-  const program = ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options, host, projectReferences: parsed.projectReferences });
   const diagnostics = [...parsed.errors, ...ts.getPreEmitDiagnostics(program), ...sqlDiagnostics]
     // Report against the real file text, and drop anything in the appended aliases.
     .map((d) => (d.file && originals.has(d.file.fileName) ? { ...d, file: originals.get(d.file.fileName)! } : d))

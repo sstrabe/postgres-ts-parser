@@ -22,6 +22,11 @@ async function completionsAfter(doc, needle) {
 }
 
 exports.run = async function run() {
+  await basics();
+  await postgresJs();
+};
+
+async function basics() {
   const file = path.resolve(__dirname, 'workspace/packages/api/src/queries.ts');
   const migration = path.resolve(__dirname, 'workspace/packages/api/db/020_nickname.sql');
   const doc = await vscode.workspace.openTextDocument(file);
@@ -38,7 +43,8 @@ exports.run = async function run() {
     // Long queries use an alias declared past the end of the file; completions still work.
     await until('aliased row completions', async () => {
       const labels = await completionsAfter(doc, 'rows[0].');
-      return { ok: ['email', 'balance', 'updated_at'].every((l) => labels.includes(l)), value: labels };
+      const hovers = await vscode.commands.executeCommand('vscode.executeHoverProvider', doc.uri, doc.positionAt(doc.getText().indexOf('const rows') + 7));
+      return { ok: ['email', 'balance', 'updated_at'].every((l) => labels.includes(l)), value: hovers.flatMap((h) => h.contents.map((c) => c.value ?? c)).join('') };
     });
 
     // Hovering the result shows the real type.
@@ -82,4 +88,35 @@ exports.run = async function run() {
     await editor.edit((b) => b.replace(new vscode.Range(0, 0, doc.lineCount, 0), original));
     await doc.save();
   }
-};
+}
+
+/** postgres.js wants `sql<Row[]>`; the plugin must read that from the tag's signature. */
+async function postgresJs() {
+  const file = path.resolve(__dirname, 'workspace/packages/app/src/users.ts');
+  const doc = await vscode.workspace.openTextDocument(file);
+  const editor = await vscode.window.showTextDocument(doc);
+  const original = doc.getText();
+  try {
+    // The file as written type-checks: no TS1320/TS2344.
+    await until('no TypeScript errors with postgres.js', async () => {
+      await wait(500);
+      const d = vscode.languages.getDiagnostics(doc.uri);
+      const hovers = await vscode.commands.executeCommand('vscode.executeHoverProvider', doc.uri, doc.positionAt(doc.getText().indexOf('const users') + 7));
+      const text = hovers.flatMap((h) => h.contents.map((c) => c.value ?? c)).join('\n');
+      const typed = /RowList<\{ id: string; username: string; display_name: string \| null;[^]*\}\[\]>/.test(text);
+      return { ok: typed && d.length === 0, value: { hover: text, diagnostics: d.map((x) => `${x.code}: ${x.message}`) } };
+    });
+    await editor.edit((b) => b.replace(new vscode.Range(0, 0, doc.lineCount, 0), original.replace('return users[0];', 'return users[0].;')));
+    await until('postgres.js row completions', async () => {
+      const labels = await completionsAfter(doc, 'return users[0].');
+      return { ok: ['username', 'avatar_file_id', 'owner_id'].every((l) => labels.includes(l)), value: labels };
+    });
+    await editor.edit((b) => b.replace(new vscode.Range(0, 0, doc.lineCount, 0), original));
+    await vscode.commands.executeCommand('postgresTs.updateTypes');
+    assert.match(doc.getText(), /dbClient\.sql<\{ id: string; username: string; [^`]*\}\[\]>`SELECT \* FROM users;`/, doc.getText());
+    console.log('E2E OK: postgres.js tag gets Row[] live, type-checks, and the write command uses Row[] too');
+  } finally {
+    await editor.edit((b) => b.replace(new vscode.Range(0, 0, doc.lineCount, 0), original));
+    await doc.save();
+  }
+}
