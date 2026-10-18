@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "scopeName": "inline.postgres-ts-sql",
+  "injectionSelector": "L:source.ts -comment -string, L:source.tsx -comment -string, L:source.js -comment -string, L:source.js.jsx -comment -string",
+  "patterns": [{ "include": "#sql-tagged-template" }, { "include": "#sql-comment-template" }],
+  "repository": {
+    "sql-tagged-template": {
+      "begin": "\\b(sql|SQL)\\s*(<.*?>)?\\s*(`)",
+      "beginCaptures": {
+        "1": { "name": "entity.name.function.tagged-template.ts" },
+        "2": { "patterns": [{ "include": "source.ts#type-arguments" }] },
+        "3": { "name": "string.template.ts punctuation.definition.string.template.begin.ts" }
+      },
+      "end": "`",
+      "endCaptures": {
+        "0": { "name": "string.template.ts punctuation.definition.string.template.end.ts" }
+      },
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [{ "include": "#substitution" }, { "include": "source.sql" }]
+    },
+    "sql-comment-template": {
+      "begin": "(/\\*\\s*(?:sql|SQL)\\s*\\*/)\\s*(`)",
+      "beginCaptures": {
+        "1": { "name": "comment.block.ts" },
+        "2": { "name": "string.template.ts punctuation.definition.string.template.begin.ts" }
+      },
+      "end": "`",
+      "endCaptures": {
+        "0": { "name": "string.template.ts punctuation.definition.string.template.end.ts" }
+      },
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [{ "include": "#substitution" }, { "include": "source.sql" }]
+    },
+    "substitution": {
+      "patterns": [{ "include": "source.ts#template-substitution-element" }]
+    }
+  }
+}

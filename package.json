@@ -1,0 +1,151 @@
+{
+  "name": "postgres-ts-sql",
+  "displayName": "Postgres TS SQL",
+  "description": "Syntax highlighting and inferred result types for sql`...` template literals, using your migrations folder as the schema.",
+  "version": "0.1.0",
+  "publisher": "sstrabe",
+  "license": "MIT",
+  "repository": "https://github.com/sstrabe/postgres-ts-parser",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "sql",
+    "postgres",
+    "postgresql",
+    "typescript",
+    "template literal",
+    "types"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact"
+  ],
+  "contributes": {
+    "grammars": [
+      {
+        "injectTo": [
+          "source.ts",
+          "source.tsx",
+          "source.js",
+          "source.js.jsx"
+        ],
+        "scopeName": "inline.postgres-ts-sql",
+        "path": "./syntaxes/sql-template.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.sql": "sql"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "postgresTs.updateTypes",
+        "title": "Postgres TS: Update SQL result types in this file"
+      },
+      {
+        "command": "postgresTs.reloadSchema",
+        "title": "Postgres TS: Reload schema from migrations"
+      }
+    ],
+    "configuration": {
+      "title": "Postgres TS SQL",
+      "properties": {
+        "postgresTs.migrationsDir": {
+          "type": "string",
+          "default": "migrations",
+          "description": "Folder containing .sql migrations. Relative paths are looked up from each file's directory upwards to the workspace root, so every package of a pnpm/yarn/npm workspace can have its own."
+        },
+        "postgresTs.migrationsExclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/*.down.sql",
+            "**/down.sql",
+            "**/revert/**",
+            "**/verify/**"
+          ],
+          "description": "Glob patterns (relative to the migrations folder) of files that are not applied."
+        },
+        "postgresTs.tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "sql"
+          ],
+          "description": "Template tag names whose queries get typed (`sql` matches `sql`...`` and `db.sql`...``). Highlighting always covers `sql` and `SQL`."
+        },
+        "postgresTs.typeTemplate": {
+          "type": "string",
+          "default": "{{row}}",
+          "markdownDescription": "Shape of the generated type argument. `{{row}}` is replaced with the row object type. Use `{{row}}[]` for libraries whose generic is the result array (e.g. postgres.js)."
+        },
+        "postgresTs.updateOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Insert/refresh inferred type arguments when a file is saved."
+        },
+        "postgresTs.typeOverrides": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "markdownDescription": "Map Postgres type names to TypeScript types, e.g. `{ \"int8\": \"bigint\", \"jsonb\": \"Record<string, unknown>\" }`."
+        },
+        "postgresTs.diagnostics": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "off"
+          ],
+          "default": "error",
+          "description": "Severity for unknown tables/columns in queries."
+        },
+        "postgresTs.reportParseErrors": {
+          "type": "boolean",
+          "default": false,
+          "description": "Report queries the SQL parser cannot parse (off by default because SQL fragments are often interpolated into larger queries)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --target=node18 --external:vscode --outfile=dist/extension.js --minify --sourcemap",
+    "watch": "pnpm build --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "package": "pnpm build && vsce package --no-dependencies",
+    "vscode:prepublish": "pnpm build",
+    "test:e2e": "pnpm build && node test/e2e/run.js"
+  },
+  "dependencies": {
+    "minimatch": "^10.2.6",
+    "pgsql-ast-parser": "12.0.2",
+    "typescript": "~5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "@types/vscode": "~1.90.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.25.0",
+    "vitest": "^3.2.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
