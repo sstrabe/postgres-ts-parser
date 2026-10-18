@@ -2,7 +2,7 @@
   "name": "postgres-ts-sql",
   "displayName": "Postgres TS SQL",
   "description": "Syntax highlighting and live inferred result types for sql`...` template literals, using your migrations folder as the schema.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "sstrabe",
   "license": "MIT",
   "repository": "https://github.com/sstrabe/postgres-ts-parser",

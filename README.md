@@ -84,5 +84,5 @@ pnpm install
 pnpm test        # unit tests, incl. the plugin on a real TypeScript language service
 pnpm test:e2e    # runs the extension in VS Code (needs a display; use xvfb-run on Linux)
 pnpm package     # builds postgres-ts-sql-<version>.vsix (bundles the tsserver plugin)
-code --install-extension postgres-ts-sql-0.1.0.vsix
+code --install-extension postgres-ts-sql-0.2.0.vsix
 ```
