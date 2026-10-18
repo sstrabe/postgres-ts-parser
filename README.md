@@ -28,6 +28,12 @@ Type arguments you write yourself (e.g. `` sql<User>`...` ``) are respected and 
 
 Plain `tsc` doesn't load language-service plugins, so in CI it sees the tag's default type. Use the bundled CLI instead of `tsc --noEmit`:
 
+```yaml
+# pnpm-workspace.yaml — pnpm 10 only runs dependency build scripts you allow
+onlyBuiltDependencies:
+  - postgres-ts-sql
+```
+
 ```sh
 pnpm add -D github:sstrabe/postgres-ts-parser
 pnpm postgres-ts-tsc -p tsconfig.json
