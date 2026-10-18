@@ -1,4 +1,4 @@
-import ts from 'typescript';
+import type * as TS from 'typescript';
 import { parse } from 'pgsql-ast-parser';
 import type * as A from 'pgsql-ast-parser';
 import { Inferrer } from './infer';
@@ -14,6 +14,9 @@ export interface SqlTemplate {
   /** Document range of the whole tagged template. */
   start: number;
   end: number;
+  /** Offset of the opening backtick, and of the first `${` or the closing backtick. */
+  templateStart: number;
+  headEnd: number;
   /** Range of an existing `<...>` type argument list, if any. */
   typeArgs?: { start: number; end: number; text: string; generated: boolean };
   /** Maps an offset in `sql` back to an offset in the document. */
@@ -28,29 +31,48 @@ interface Segment {
   placeholder: boolean;
 }
 
-export function findSqlTemplates(fileName: string, text: string, tags: string[]): SqlTemplate[] {
+export interface FoundTemplates {
+  templates: SqlTemplate[];
+  /** The file has imports or exports, so declarations appended to it stay file-local. */
+  isModule: boolean;
+}
+
+/** `ts` is passed in so the tsserver plugin can use the editor's own TypeScript. */
+export function findSqlTemplates(ts: typeof TS, fileName: string, text: string, tags: string[]): SqlTemplate[] {
+  return scanSqlTemplates(ts, fileName, text, tags).templates;
+}
+
+export function scanSqlTemplates(ts: typeof TS, fileName: string, text: string, tags: string[]): FoundTemplates {
   const kind = /\.[cm]?tsx$|\.jsx$/.test(fileName) ? ts.ScriptKind.TSX : /\.[cm]?js$/.test(fileName) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
   const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, kind);
   const tagSet = new Set(tags);
   const out: SqlTemplate[] = [];
 
-  const visit = (node: ts.Node) => {
-    if (ts.isTaggedTemplateExpression(node) && tagSet.has(tagName(node.tag))) {
-      out.push(toTemplate(node, source));
+  const visit = (node: TS.Node) => {
+    if (ts.isTaggedTemplateExpression(node) && tagSet.has(tagName(ts, node.tag))) {
+      out.push(toTemplate(ts, node, source));
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return out;
+  const isModule = source.statements.some(
+    (st) =>
+      ts.isImportDeclaration(st) ||
+      ts.isImportEqualsDeclaration(st) ||
+      ts.isExportDeclaration(st) ||
+      ts.isExportAssignment(st) ||
+      (ts.canHaveModifiers(st) && !!ts.getModifiers(st)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)),
+  );
+  return { templates: out, isModule };
 }
 
-function tagName(tag: ts.Expression): string {
+function tagName(ts: typeof TS, tag: TS.Expression): string {
   if (ts.isIdentifier(tag)) return tag.text;
   if (ts.isPropertyAccessExpression(tag)) return tag.name.text;
   return '';
 }
 
-function toTemplate(node: ts.TaggedTemplateExpression, source: ts.SourceFile): SqlTemplate {
+function toTemplate(ts: typeof TS, node: TS.TaggedTemplateExpression, source: TS.SourceFile): SqlTemplate {
   const text = source.text;
   const segments: Segment[] = [];
   let sql = '';
@@ -80,13 +102,17 @@ function toTemplate(node: ts.TaggedTemplateExpression, source: ts.SourceFile): S
     const start = node.tag.end;
     const end = node.template.getStart(source);
     const only = node.typeArguments.length === 1 ? node.typeArguments[0] : undefined;
-    typeArgs = { start, end, text: text.slice(start, end).trim(), generated: !!only && looksGenerated(only) };
+    typeArgs = { start, end, text: text.slice(start, end).trim(), generated: !!only && looksGenerated(ts, only) };
   }
+  const templateStart = tpl.getStart(source);
+  const headEnd = ts.isNoSubstitutionTemplateLiteral(tpl) ? tpl.end - 1 : tpl.head.end - 2;
 
   return {
     sql,
     tagStart: node.tag.getStart(source),
     tagEnd: node.tag.end,
+    templateStart,
+    headEnd,
     start: node.getStart(source),
     end: node.end,
     typeArgs,
@@ -104,13 +130,13 @@ function toTemplate(node: ts.TaggedTemplateExpression, source: ts.SourceFile): S
 }
 
 /** True for type arguments this extension writes: `{ ... }`, `{ ... }[]`, `Record<string, never>`. */
-function looksGenerated(type: ts.TypeNode): boolean {
+function looksGenerated(ts: typeof TS, type: TS.TypeNode): boolean {
   if (ts.isTypeLiteralNode(type)) return true;
-  if (ts.isArrayTypeNode(type)) return looksGenerated(type.elementType);
+  if (ts.isArrayTypeNode(type)) return looksGenerated(ts, type.elementType);
   if (ts.isTypeReferenceNode(type) && ts.isIdentifier(type.typeName)) {
     if (type.typeName.text === 'Record') return true;
     if ((type.typeName.text === 'Array' || type.typeName.text === 'ReadonlyArray') && type.typeArguments?.length === 1) {
-      return looksGenerated(type.typeArguments[0]);
+      return looksGenerated(ts, type.typeArguments[0]);
     }
   }
   return false;

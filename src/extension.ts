@@ -1,172 +1,85 @@
 import * as path from 'node:path';
+import ts from 'typescript';
 import * as vscode from 'vscode';
-import { LoadedSchema, findMigrationsDir, loadSchema } from './core/loader';
-import { QueryAnalysis, SqlTemplate, TypeEdit, analyzeQuery, findSqlTemplates, typeArgumentEdit } from './core/templates';
-import { applyTemplate, columnType, rowType } from './core/typegen';
+import { TypeEdit, typeArgumentEdit } from './core/templates';
+import { Config, SchemaStore, resolveConfig, virtualize } from './core/virtual';
 
-const LANGUAGES = ['typescript', 'typescriptreact', 'javascript', 'javascriptreact'];
-const SELECTOR = LANGUAGES.map((language) => ({ language }));
+const PLUGIN_NAME = 'postgres-ts-sql-plugin';
+const TS_LANGUAGES = ['typescript', 'typescriptreact'];
 
-interface Settings {
-  migrationsDir: string;
-  migrationsExclude: string[];
-  tags: string[];
-  typeTemplate: string;
-  updateOnSave: boolean;
-  typeOverrides: Record<string, string>;
-  diagnostics: 'error' | 'warning' | 'off';
-  reportParseErrors: boolean;
-}
-
-function settings(scope?: vscode.Uri): Settings {
+function readConfig(scope?: vscode.Uri): Config & { updateOnSave: boolean } {
   const c = vscode.workspace.getConfiguration('postgresTs', scope);
+  const pick = <K extends keyof Config>(k: K) => c.get<Config[K]>(k);
   return {
-    migrationsDir: c.get('migrationsDir', 'migrations'),
-    migrationsExclude: c.get('migrationsExclude', []),
-    tags: c.get('tags', ['sql']),
-    typeTemplate: c.get('typeTemplate', '{{row}}'),
-    updateOnSave: c.get('updateOnSave', true),
-    typeOverrides: c.get('typeOverrides', {}),
-    diagnostics: c.get('diagnostics', 'error'),
-    reportParseErrors: c.get('reportParseErrors', false),
+    ...resolveConfig({
+      migrationsDir: pick('migrationsDir'),
+      migrationsExclude: pick('migrationsExclude'),
+      tags: pick('tags'),
+      typeTemplate: pick('typeTemplate'),
+      typeOverrides: pick('typeOverrides'),
+      diagnostics: pick('diagnostics'),
+      reportParseErrors: pick('reportParseErrors'),
+    }),
+    updateOnSave: c.get('updateOnSave', false),
   };
 }
 
-interface AnalyzedTemplate {
-  template: SqlTemplate;
-  analysis: QueryAnalysis;
-}
-
-interface DocumentAnalysis {
-  version: number;
-  loaded?: LoadedSchema;
-  templates: AnalyzedTemplate[];
-}
-
-export function activate(context: vscode.ExtensionContext) {
+/**
+ * Types are provided by the tsserver plugin (see tsPlugin.ts), which this extension
+ * registers and configures. The extension itself adds the grammar and an explicit
+ * "write the types into the file" command for code that must type-check without the plugin.
+ */
+export async function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel('Postgres TS SQL');
-  const diagnostics = vscode.languages.createDiagnosticCollection('postgres-ts-sql');
-  const schemas = new Map<string, LoadedSchema>();
-  const analyses = new WeakMap<vscode.TextDocument, DocumentAnalysis>();
-  const timers = new Map<string, NodeJS.Timeout>();
+  let config = readConfig();
+  const store = new SchemaStore(() => config, undefined, (loaded) => {
+    output.appendLine(`Loaded ${loaded.fileCount} migration file(s) from ${loaded.dir}: ${loaded.schema.relations.size} table(s)/view(s).`);
+    for (const w of loaded.warnings) output.appendLine(`  skipped statement in ${w.path}: ${w.message}\n    ${w.statement.split('\n')[0]}`);
+  });
 
-  const schemaFor = (doc: vscode.TextDocument): LoadedSchema | undefined => {
-    const s = settings(doc.uri);
-    const root = vscode.workspace.getWorkspaceFolder(doc.uri)?.uri.fsPath;
-    const dir = findMigrationsDir(doc.uri.fsPath, root, s.migrationsDir);
-    if (!dir) return undefined;
-    let loaded = schemas.get(dir);
-    if (!loaded) {
-      try {
-        loaded = loadSchema(dir, s.migrationsExclude);
-      } catch (err) {
-        output.appendLine(`Failed to load ${dir}: ${err instanceof Error ? err.message : err}`);
-        return undefined;
-      }
-      schemas.set(dir, loaded);
-      output.appendLine(`Loaded ${loaded.fileCount} migration file(s) from ${dir}: ${loaded.schema.relations.size} table(s)/view(s).`);
-      for (const w of loaded.warnings) {
-        output.appendLine(`  skipped statement in ${w.path}: ${w.message}\n    ${w.statement.split('\n')[0]}`);
-      }
-    }
-    return loaded;
+  const configurePlugin = async () => {
+    const tsExtension = vscode.extensions.getExtension('vscode.typescript-language-features');
+    if (!tsExtension) return;
+    const api = (await tsExtension.activate())?.getAPI?.(0);
+    const { updateOnSave: _, ...pluginConfig } = config;
+    api?.configurePlugin(PLUGIN_NAME, pluginConfig);
   };
 
-  const analyze = (doc: vscode.TextDocument): DocumentAnalysis => {
-    const cached = analyses.get(doc);
-    if (cached && cached.version === doc.version) return cached;
-    const loaded = schemaFor(doc);
-    const templates = findSqlTemplates(doc.fileName, doc.getText(), settings(doc.uri).tags).map((template) => ({
-      template,
-      analysis: loaded ? analyzeQuery(template.sql, loaded.schema) : { columns: null, diagnostics: [] },
-    }));
-    const result = { version: doc.version, loaded, templates };
-    analyses.set(doc, result);
-    return result;
-  };
-
-  const editsFor = (doc: vscode.TextDocument, only?: AnalyzedTemplate[]): TypeEdit[] => {
-    if (!doc.languageId.startsWith('typescript')) return []; // type arguments are TS syntax
-    const { loaded, templates } = analyze(doc);
-    if (!loaded) return [];
-    const s = settings(doc.uri);
-    return (only ?? templates)
-      .map((t) => typeArgumentEdit(t.template, t.analysis, loaded.schema, { typeTemplate: s.typeTemplate, overrides: s.typeOverrides }))
+  const editsFor = (doc: vscode.TextDocument, range?: vscode.Range): TypeEdit[] => {
+    if (!TS_LANGUAGES.includes(doc.languageId)) return []; // type arguments are TS syntax
+    const virtual = virtualize(ts, doc.fileName, doc.getText(), store.forFile(doc.uri.fsPath), config);
+    if (!virtual.loaded) return [];
+    return virtual.templates
+      .filter(({ template }) => !range || (doc.offsetAt(range.start) <= template.end && doc.offsetAt(range.end) >= template.start))
+      .map(({ template, analysis }) =>
+        typeArgumentEdit(template, analysis, virtual.loaded!.schema, { typeTemplate: config.typeTemplate, overrides: config.typeOverrides }),
+      )
       .filter((e): e is TypeEdit => !!e);
   };
 
   const toTextEdit = (doc: vscode.TextDocument, e: TypeEdit) =>
     vscode.TextEdit.replace(new vscode.Range(doc.positionAt(e.start), doc.positionAt(e.end)), e.newText);
 
-  const refreshDiagnostics = (doc: vscode.TextDocument) => {
-    if (!LANGUAGES.includes(doc.languageId)) return;
-    const s = settings(doc.uri);
-    if (s.diagnostics === 'off') {
-      diagnostics.delete(doc.uri);
-      return;
-    }
-    const { loaded, templates } = analyze(doc);
-    if (!loaded) {
-      diagnostics.delete(doc.uri);
-      return;
-    }
-    const severity = s.diagnostics === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
-    const out: vscode.Diagnostic[] = [];
-    for (const { template, analysis } of templates) {
-      const found = [...analysis.diagnostics];
-      if (analysis.parseError && s.reportParseErrors) found.push(analysis.parseError);
-      for (const d of found) {
-        const start = doc.positionAt(template.toDocumentOffset(d.start));
-        const end = doc.positionAt(Math.max(template.toDocumentOffset(d.end), template.toDocumentOffset(d.start) + 1));
-        const diag = new vscode.Diagnostic(new vscode.Range(start, end), d.message, severity);
-        diag.source = 'postgres-ts-sql';
-        out.push(diag);
-      }
-    }
-    diagnostics.set(doc.uri, out);
-  };
-
-  const schedule = (doc: vscode.TextDocument) => {
-    const key = doc.uri.toString();
-    clearTimeout(timers.get(key));
-    timers.set(key, setTimeout(() => (timers.delete(key), refreshDiagnostics(doc)), 250));
-  };
-
-  const reloadAll = () => {
-    schemas.clear();
-    for (const doc of vscode.workspace.textDocuments) {
-      analyses.delete(doc);
-      refreshDiagnostics(doc);
-    }
-  };
-
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.sql');
   const onSqlChange = (uri: vscode.Uri) => {
-    let changed = false;
-    for (const dir of [...schemas.keys()]) {
-      const rel = path.relative(dir, uri.fsPath);
-      if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
-        schemas.delete(dir);
-        changed = true;
-      }
-    }
-    if (changed) reloadAll();
+    if (store.dirs.some((dir) => !path.relative(dir, uri.fsPath).startsWith('..'))) store.clear();
   };
 
   context.subscriptions.push(
     output,
-    diagnostics,
     watcher,
     watcher.onDidChange(onSqlChange),
     watcher.onDidCreate(onSqlChange),
     watcher.onDidDelete(onSqlChange),
-    vscode.workspace.onDidOpenTextDocument(refreshDiagnostics),
-    vscode.workspace.onDidChangeTextDocument((e) => schedule(e.document)),
-    vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.delete(doc.uri)),
-    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration('postgresTs') && reloadAll()),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (!e.affectsConfiguration('postgresTs')) return;
+      config = readConfig();
+      store.clear();
+      void configurePlugin();
+    }),
 
     vscode.workspace.onWillSaveTextDocument((e) => {
-      if (!LANGUAGES.includes(e.document.languageId) || !settings(e.document.uri).updateOnSave) return;
+      if (!config.updateOnSave) return;
       const edits = editsFor(e.document).map((x) => toTextEdit(e.document, x));
       if (edits.length) e.waitUntil(Promise.resolve(edits));
     }),
@@ -175,71 +88,41 @@ export function activate(context: vscode.ExtensionContext) {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
       const doc = editor.document;
-      if (!schemaFor(doc)) {
-        vscode.window.showWarningMessage(`No "${settings(doc.uri).migrationsDir}" folder found above ${path.basename(doc.fileName)}.`);
+      if (!store.forFile(doc.uri.fsPath)) {
+        vscode.window.showWarningMessage(`No "${config.migrationsDir}" folder found above ${path.basename(doc.fileName)}.`);
         return;
       }
       const edits = editsFor(doc);
       await editor.edit((b) => edits.forEach((x) => b.replace(toTextEdit(doc, x).range, x.newText)));
     }),
 
-    vscode.commands.registerCommand('postgresTs.reloadSchema', () => {
-      reloadAll();
+    vscode.commands.registerCommand('postgresTs.reloadSchema', async () => {
+      store.clear();
+      // Re-sending the configuration makes the tsserver plugin reload too.
+      await configurePlugin();
       output.show(true);
     }),
 
     vscode.languages.registerCodeActionsProvider(
-      SELECTOR,
+      TS_LANGUAGES.map((language) => ({ language })),
       {
         provideCodeActions(doc, range) {
-          const { templates } = analyze(doc);
-          const hits = templates.filter(
-            (t) => doc.offsetAt(range.start) <= t.template.end && doc.offsetAt(range.end) >= t.template.start,
-          );
-          const edits = editsFor(doc, hits);
+          const edits = editsFor(doc, range);
           if (!edits.length) return [];
           const action = new vscode.CodeAction(
-            edits.length === 1 ? 'Write inferred SQL result type' : `Write ${edits.length} inferred SQL result types`,
-            vscode.CodeActionKind.QuickFix,
+            edits.length === 1 ? 'Write inferred SQL result type into the source' : `Write ${edits.length} inferred SQL result types into the source`,
+            vscode.CodeActionKind.RefactorRewrite,
           );
           action.edit = new vscode.WorkspaceEdit();
           for (const e of edits) action.edit.replace(doc.uri, toTextEdit(doc, e).range, e.newText);
-          action.isPreferred = true;
           return [action];
         },
       },
-      { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] },
+      { providedCodeActionKinds: [vscode.CodeActionKind.RefactorRewrite] },
     ),
-
-    vscode.languages.registerHoverProvider(SELECTOR, {
-      provideHover(doc, position) {
-        const offset = doc.offsetAt(position);
-        const { loaded, templates } = analyze(doc);
-        const hit = templates.find((t) => offset >= t.template.tagStart && offset <= t.template.tagEnd);
-        if (!hit) return undefined;
-        const md = new vscode.MarkdownString();
-        if (!loaded) {
-          md.appendText(`No "${settings(doc.uri).migrationsDir}" folder found for this file.`);
-        } else if (hit.analysis.parseError) {
-          md.appendText(hit.analysis.parseError.message);
-        } else if (!hit.analysis.columns) {
-          md.appendText('Statement returns no rows.');
-        } else {
-          const s = settings(doc.uri);
-          const opts = { overrides: s.typeOverrides };
-          md.appendCodeblock(applyTemplate(s.typeTemplate, rowType(hit.analysis.columns, loaded.schema, opts)), 'typescript');
-          for (const c of hit.analysis.columns) {
-            const from = c.source ? ` — \`${c.source}\`` : '';
-            const comment = c.comment ? ` — ${c.comment}` : '';
-            md.appendMarkdown(`\n- \`${c.name}: ${columnType(c, loaded.schema, opts)}\`${from}${comment}`);
-          }
-        }
-        return new vscode.Hover(md, new vscode.Range(doc.positionAt(hit.template.tagStart), doc.positionAt(hit.template.tagEnd)));
-      },
-    }),
   );
 
-  for (const doc of vscode.workspace.textDocuments) refreshDiagnostics(doc);
+  await configurePlugin();
 }
 
 export function deactivate() {}

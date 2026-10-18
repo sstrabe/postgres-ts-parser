@@ -1,7 +1,7 @@
 {
   "name": "postgres-ts-sql",
   "displayName": "Postgres TS SQL",
-  "description": "Syntax highlighting and inferred result types for sql`...` template literals, using your migrations folder as the schema.",
+  "description": "Syntax highlighting and live inferred result types for sql`...` template literals, using your migrations folder as the schema.",
   "version": "0.1.0",
   "publisher": "sstrabe",
   "license": "MIT",
@@ -47,7 +47,7 @@
     "commands": [
       {
         "command": "postgresTs.updateTypes",
-        "title": "Postgres TS: Update SQL result types in this file"
+        "title": "Postgres TS: Write inferred SQL result types into this file"
       },
       {
         "command": "postgresTs.reloadSchema",
@@ -92,8 +92,8 @@
         },
         "postgresTs.updateOnSave": {
           "type": "boolean",
-          "default": true,
-          "description": "Insert/refresh inferred type arguments when a file is saved."
+          "default": false,
+          "description": "Also write inferred type arguments into the source on save. Not needed in the editor (types are applied live); only useful if plain tsc must see them."
         },
         "postgresTs.typeOverrides": {
           "type": "object",
@@ -111,7 +111,7 @@
             "off"
           ],
           "default": "error",
-          "description": "Severity for unknown tables/columns in queries."
+          "description": "Severity for unknown tables/columns in queries (reported through TypeScript)."
         },
         "postgresTs.reportParseErrors": {
           "type": "boolean",
@@ -119,16 +119,22 @@
           "description": "Report queries the SQL parser cannot parse (off by default because SQL fragments are often interpolated into larger queries)."
         }
       }
-    }
+    },
+    "typescriptServerPlugins": [
+      {
+        "name": "postgres-ts-sql-plugin",
+        "enableForWorkspaceTypeScriptVersions": true
+      }
+    ]
   },
   "scripts": {
-    "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --target=node18 --external:vscode --outfile=dist/extension.js --minify --sourcemap",
-    "watch": "pnpm build --watch",
+    "build": "node scripts/build.mjs",
+    "watch": "node scripts/build.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "package": "pnpm build && vsce package --no-dependencies",
-    "vscode:prepublish": "pnpm build",
-    "test:e2e": "pnpm build && node test/e2e/run.js"
+    "test:e2e": "pnpm build && node test/e2e/run.js",
+    "package": "node scripts/package.mjs",
+    "prepare": "node scripts/build.mjs"
   },
   "dependencies": {
     "minimatch": "^10.2.6",
@@ -147,5 +153,8 @@
     "onlyBuiltDependencies": [
       "esbuild"
     ]
+  },
+  "bin": {
+    "postgres-ts-tsc": "./dist/cli.js"
   }
 }

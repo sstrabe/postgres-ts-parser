@@ -1,9 +1,11 @@
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildSchema, splitStatements } from '../src/core/migrations';
 import { analyzeQuery, findSqlTemplates, typeArgumentEdit } from '../src/core/templates';
 import { rowType } from '../src/core/typegen';
+import { resolveConfig, restoreOriginal, virtualize } from '../src/core/virtual';
 
 const dir = join(__dirname, 'fixtures/migrations');
 const files = readdirSync(dir)
@@ -74,7 +76,7 @@ describe('templates', () => {
     'const c = await sql<User>`SELECT * FROM users`;',
     'const d = await sql`UPDATE users SET name = ${n}`;',
   ].join('\n');
-  const templates = findSqlTemplates('x.ts', source, ['sql']);
+  const templates = findSqlTemplates(ts, 'x.ts', source, ['sql']);
 
   it('extracts SQL with placeholders and maps offsets back', () => {
     expect(templates.map((t) => t.sql)).toEqual([
@@ -110,5 +112,49 @@ describe('loader', () => {
     expect(loaded.fileCount).toBe(3);
     expect(loaded.schema.relations.has('public.posts')).toBe(true);
     expect(findMigrationsDir(join(root, 'src/x.ts'), root, 'migrations')).toBeUndefined();
+  });
+});
+
+describe('virtual files', () => {
+  const loaded = { dir, schema, warnings: [], fileCount: 3 };
+  const cfg = resolveConfig();
+
+  it('writes row types into the template head without moving any other character', () => {
+    const source = [
+      'import { sql } from "./db";',
+      'const a = sql`SELECT id, email, name, role, balance, created_at FROM users WHERE id = ${id} AND true`;',
+      'const b = sql`',
+      '  SELECT id',
+      '  FROM users',
+      '`;',
+      'const c = sql`SELECT x FROM nowhere`;',
+    ].join('\n');
+    const v = virtualize(ts, 'q.ts', source, loaded, cfg);
+    expect(v.text.slice(0, source.length).length).toBe(source.length);
+    // Everything outside the rewritten spans is identical.
+    const outside = (text: string) => v.regions.reduceRight((t, r) => t.slice(0, r.start) + t.slice(r.end), text.slice(0, source.length));
+    expect(outside(v.text)).toBe(outside(source));
+    expect(v.text).toContain('sql<SqlRow0>`');
+    expect(v.text).toContain('sql<{ id: number }>`');
+    expect(v.text).toContain('${id} AND true`');
+    expect(v.text).toContain('sql`SELECT x FROM nowhere`');
+    expect(v.text.slice(source.length)).toMatch(/^\n;type SqlRow0 = \{ id: number; email: string; .* \};$/);
+    // The result must still be valid TypeScript.
+    const sf = ts.createSourceFile('q.ts', v.text, ts.ScriptTarget.Latest, true);
+    expect((sf as unknown as { parseDiagnostics: unknown[] }).parseDiagnostics).toEqual([]);
+  });
+
+  it('leaves JavaScript, script files and explicit type arguments alone', () => {
+    expect(virtualize(ts, 'q.js', 'sql`SELECT id FROM users`', loaded, cfg).regions).toEqual([]);
+    expect(virtualize(ts, 'q.ts', 'sql<X>`SELECT id FROM users`', loaded, cfg).regions).toEqual([]);
+    // Too long to inline and no module scope for an alias.
+    expect(virtualize(ts, 'q.ts', 'sql`SELECT * FROM users WHERE id = ${1}`', loaded, cfg).regions).toEqual([]);
+  });
+
+  it('restores original text in edits computed from the virtual file', () => {
+    const source = 'export const b = sql`SELECT id FROM users`;';
+    const v = virtualize(ts, 'q.ts', source, loaded, cfg);
+    const extracted = v.text.slice(v.text.indexOf('sql'), v.text.indexOf(';'));
+    expect(restoreOriginal(`function f() { return ${extracted}; }`, v.regions)).toBe('function f() { return sql`SELECT id FROM users`; }');
   });
 });

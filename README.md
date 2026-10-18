@@ -3,27 +3,47 @@
 A VS Code extension for inline Postgres in TypeScript:
 
 - **Syntax highlighting** inside `` sql`...` `` (and `` db.sql`...` ``, `` SQL`...` ``, `` /* sql */ `...` ``), with `${...}` interpolations still highlighted as TypeScript.
-- **Inferred result types.** Each query is parsed into an AST ([pgsql-ast-parser](https://github.com/oguimbal/pgsql-ast-parser)) and typed against a schema built from your migrations folder — no running database. The row type is written into the tag's type argument, so the TypeScript language service gives you real autocompletion and type checking on query results:
+- **Live inferred result types.** Each query is parsed into an AST ([pgsql-ast-parser](https://github.com/oguimbal/pgsql-ast-parser)) and typed against a schema built from your migrations folder — no running database. A TypeScript server plugin hands the type to the compiler as the tag's type argument **in memory only**: your source is never edited, and types update as you type or when a migration changes.
 
   ```ts
-  // before save
   const [user] = await sql`SELECT id, name, role FROM users WHERE id = ${id}`;
-  // after save
-  const [user] = await sql<{ id: number; name: string | null; role: "admin" | "member" }>`SELECT id, name, role FROM users WHERE id = ${id}`;
   user. // → id, name, role
+  // hover: const user: { id: number; name: string | null; role: "admin" | "member" }
   ```
 
-- **Diagnostics** for unknown tables and columns, ambiguous columns, and bad `INSERT`/`UPDATE` targets.
-- **Hover** on the tag shows the row type with each column's origin (`users.email`) and its `COMMENT ON COLUMN`.
+- **Diagnostics** for unknown tables and columns, ambiguous columns, and bad `INSERT`/`UPDATE` targets, reported by TypeScript itself (code `TS99001`).
+- **Hover** on the tag lists each column with its origin (`users.email`) and its `COMMENT ON COLUMN`.
+- **`postgres-ts-tsc`**, a drop-in for `tsc --noEmit` that sees the same types, for CI.
 
 ## How it works
 
-1. The nearest `migrations` folder (setting `postgresTs.migrationsDir`) is found by walking up from the edited file to the workspace root, so every package in a pnpm workspace can have its own.
-2. All `.sql` files in it are applied in natural order (`2_x.sql` before `10_x.sql`): `CREATE/ALTER/DROP TABLE`, enums, domains, composite types, views, functions, comments. Down migrations are skipped (`*.down.sql`, dbmate `-- migrate:down`, goose `-- +goose Down`). Statements that don't affect types (triggers, grants, policies, …) are ignored; anything unparseable is listed in the *Postgres TS SQL* output channel.
+1. The nearest `migrations` folder (setting `postgresTs.migrationsDir`) is found by walking up from the edited file, so every package in a pnpm workspace can have its own.
+2. All `.sql` files in it are applied in natural order (`2_x.sql` before `10_x.sql`): `CREATE/ALTER/DROP TABLE`, enums, domains, composite types, views, functions, comments. Down migrations are skipped (`*.down.sql`, dbmate `-- migrate:down`, goose `-- +goose Down`). Statements that don't affect types (triggers, grants, policies, …) are ignored; anything unparseable is listed in the TypeScript server log.
 3. Each tagged template becomes SQL with `$1, $2, …` for interpolations, is parsed, and every select item is typed: joins (outer joins make columns nullable), `USING`, subqueries, `LATERAL`, CTEs (incl. recursive), `UNION`, `VALUES`, `RETURNING`, casts, `CASE`, `COALESCE`, aggregates and window functions, JSON operators, and common built-in functions. `WHERE x IS NOT NULL` / `WHERE x = …` narrow `x` to non-null.
-4. On save (or via the quick fix / *Postgres TS: Update SQL result types in this file*), the `<...>` type argument is inserted or refreshed. Type arguments the extension didn't write (e.g. `` sql<User>`...` ``) are never touched.
+4. The plugin gives TypeScript a rewritten copy of the file in which `` sql`SELECT …` `` reads `` sql<{ … }>` …` ``. The type argument takes the place of the start of the SQL text, which doesn't matter to the type checker, so **every other character keeps its offset** and errors, completions and refactors line up with the real file. When the type is longer than that text, a short alias (`sql<SqlRow0>`) is used and declared after the end of the file; hovers and error messages show the full type instead of the alias name.
 
-Changes to migration files are picked up automatically.
+Type arguments you write yourself (e.g. `` sql<User>`...` ``) are respected and left alone.
+
+## Type-checking outside the editor
+
+Plain `tsc` doesn't load language-service plugins, so in CI it sees the tag's default type. Use the bundled CLI instead of `tsc --noEmit`:
+
+```sh
+pnpm add -D github:sstrabe/postgres-ts-parser
+pnpm postgres-ts-tsc -p tsconfig.json
+```
+
+It reads the plugin's options from `tsconfig.json`, which also works for editors other than VS Code:
+
+```jsonc
+{
+  "compilerOptions": {
+    "plugins": [{ "name": "postgres-ts-sql-plugin", "migrationsDir": "db", "typeTemplate": "{{row}}[]" }]
+  }
+}
+```
+
+If you'd rather have the types in the source, *Postgres TS: Write inferred SQL result types into this file* (or the refactoring on a query, or `postgresTs.updateOnSave`) writes them in.
 
 ## Settings
 
@@ -33,7 +53,7 @@ Changes to migration files are picked up automatically.
 | `postgresTs.migrationsExclude` | `**/*.down.sql`, … | Globs relative to the migrations folder. |
 | `postgresTs.tags` | `["sql"]` | Tag names that get typed. |
 | `postgresTs.typeTemplate` | `{{row}}` | Use `{{row}}[]` for libraries whose generic is the result array, e.g. **postgres.js** (`` sql<Row[]>`...` ``). |
-| `postgresTs.updateOnSave` | `true` | Write types on save. |
+| `postgresTs.updateOnSave` | `false` | Also write the types into the source on save. |
 | `postgresTs.typeOverrides` | `{}` | e.g. `{ "int8": "bigint", "jsonb": "MyJson" }`. |
 | `postgresTs.diagnostics` | `error` | `error`, `warning` or `off`. |
 | `postgresTs.reportParseErrors` | `false` | Report SQL the parser can't handle (off because fragments like `` sql`AND x = 1` `` are common). |
@@ -48,6 +68,8 @@ Your `sql` tag must accept a type argument (postgres.js, `@vercel/postgres`, `@n
 - Only SQL [pgsql-ast-parser](https://github.com/oguimbal/pgsql-ast-parser) understands gets typed; other queries are left alone.
 - Queries built from interpolated fragments (`` sql`SELECT * FROM ${table}` ``) can't be typed.
 - Type arguments are TypeScript syntax, so `.js` files get highlighting, hovers and diagnostics only.
+- Queries whose text before the first `${...}` is shorter than about 10 characters (e.g. `` sql`${fragment}` ``) can't carry a type in memory.
+- In script files (no `import`/`export`) only types that fit inline are applied, since an alias would be global.
 
 ## Development
 
@@ -55,6 +77,6 @@ Your `sql` tag must accept a type argument (postgres.js, `@vercel/postgres`, `@n
 pnpm install
 pnpm test        # unit tests
 pnpm test:e2e    # runs the extension in VS Code (needs a display; use xvfb-run on Linux)
-pnpm package     # builds postgres-ts-sql-<version>.vsix
+pnpm package     # builds postgres-ts-sql-<version>.vsix (bundles the tsserver plugin)
 code --install-extension postgres-ts-sql-0.1.0.vsix
 ```
